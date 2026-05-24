@@ -620,54 +620,101 @@ in
     name: packageId:
     let
       testsDrv = builtCrates.crates.${packageId}.override { buildTests = true; };
-    in
-    {
-      inherit packageId;
-      build = builtCrates.crates.${packageId};
-      # Compile tests with dev-dependencies wired in. Equivalent to
-      # `.build.override { buildTests = true; }` — buildRustCrate folds
-      # devDependencies into the --extern set only when buildTests is set.
-      buildTests = testsDrv;
       # Batteries-included runner: sequential across test binaries (matches
       # `cargo test`), libtest parallelism inside each. nativeCheckInputs
       # set via crateOverrides are forwarded so tests that shell out to
       # external tools find them on PATH at runtime too.
-      runTests = pkgs.stdenvNoCC.mkDerivation {
-        name = "${name}-tests";
+      mkTests =
+        {
+          testsDrv,
+          testInputs ? [ ],
+          testPreRun ? "",
+          testPostRun ? "",
+        }:
+        pkgs.stdenvNoCC.mkDerivation {
+          name = "${name}-tests";
 
-        inherit (testsDrv)
-          src
-          nativeCheckInputs
-          ;
+          inherit (testsDrv) src;
 
-        dontConfigure = true;
-        dontBuild = true;
-        doCheck = true;
+          nativeCheckInputs = testsDrv.nativeCheckInputs ++ testInputs;
 
-        checkPhase = ''
-          runHook preCheck
+          dontConfigure = true;
+          dontBuild = true;
+          doCheck = true;
 
-          export CARGO_TARGET_TMPDIR="$(mktemp -d)"
-          export RUST_BACKTRACE=''${RUST_BACKTRACE-1}
-          shopt -s nullglob
-          for t in ${testsDrv}/tests/*; do
-            echo "── running $(basename "$t")"
-            "$t"
-          done
+          checkPhase = ''
+            runHook preCheck
+            ${testPreRun}
 
-          runHook postCheck
-        '';
+            export CARGO_TARGET_TMPDIR="$(mktemp -d)"
+            export RUST_BACKTRACE=''${RUST_BACKTRACE-1}
+            shopt -s nullglob
+            for t in ${testsDrv}/tests/*; do
+              echo "── running $(basename "$t")"
+              "$t"
+            done
 
-        installPhase = ''
-          runHook preInstall
+            ${testPostRun}
+            runHook postCheck
+          '';
 
-          touch $out
+          installPhase = ''
+            runHook preInstall
 
-          runHook postInstall
-        '';
+            touch $out
 
-        passthru = { inherit testsDrv; };
-      };
+            runHook postInstall
+          '';
+
+          passthru = { inherit testsDrv; };
+        };
+
+      mkBuild =
+        {
+          runTests ? false,
+          testInputs ? [ ],
+          testPreRun ? "",
+          testPostRun ? "",
+          ...
+        }:
+        if runTests then
+          (
+            let
+              testsRunner = mkTests {
+                inherit
+                  testsDrv
+                  testInputs
+                  testPreRun
+                  testPostRun
+                  ;
+              };
+            in
+            pkgs.runCommand "${testsDrv.name}-linked"
+              {
+                inherit (testsDrv) outputs crateName;
+                meta = testsDrv.meta or { };
+                passthru = (testsDrv.passthru or { }) // {
+                  inherit testsRunner;
+                };
+              }
+              (
+                lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
+                  echo tested by ${testsRunner}
+                ''
+                + lib.concatMapStringsSep "\n" (o: "ln -s ${testsDrv.${o}} ${"$"}${o}") testsDrv.outputs
+              )
+          )
+        else
+          testsDrv;
+    in
+    {
+      inherit packageId;
+      build = lib.makeOverridable mkBuild { };
+      # Compile tests with dev-dependencies wired in. Equivalent to
+      # `.build.override { buildTests = true; }` — buildRustCrate folds
+      # devDependencies into the --extern set only when buildTests is set.
+      buildTests = testsDrv;
+      runTests = mkTests { inherit testsDrv; };
     }
   ) resolved.workspaceMembers;
 
